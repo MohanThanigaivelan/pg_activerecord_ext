@@ -81,27 +81,32 @@ module ActiveRecord
 
 
       def exec_no_cache(sql, name, binds)
-        materialize_transactions
-        mark_transaction_written_if_write(sql)
+        result = __submit_exec_no_cache(sql, name, binds)
+        if is_pipeline_mode?
+          future_result = FutureResult.new(self, sql, binds)
+          future_result.retry_object = self
+          future_result.retry_args = [sql , name, binds]
+          future_result.retry_method = :__submit_exec_no_cache
+          @counter += 1
+          push_to_piped_results(future_result)
+          future_result
+        else
+          result
+        end
+      end
 
-        # make sure we carry over any changes to ActiveRecord::Base.default_timezone that have been
-        # made since we established the connection
-        update_typemap_for_default_timezone
-
-        type_casted_binds = type_casted_binds(binds)
-        log(sql, name, binds, type_casted_binds) do
-          ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
-            if is_pipeline_mode?
-              #If Pipeline mode return future result objects
-              @connection.send_query_params(sql, type_casted_binds)
-              future_result = FutureResult.new(self, sql, binds)
-              @counter += 1
-              @piped_results << future_result
-              future_result
-            else
-              @connection.exec_params(sql, type_casted_binds)
-            end
-          end
+      def exec_cache(sql, name, binds)
+        result = __submit_exec_cache(sql, name, binds)
+        if is_pipeline_mode?
+          future_result = FutureResult.new(self, sql, binds)
+          future_result.retry_object = self
+          future_result.retry_args = [sql, name, binds]
+          future_result.retry_method = :__submit_exec_cache
+          @counter += 1
+          push_to_piped_results(future_result)
+          future_result
+        else
+          result
         end
       end
 
@@ -142,41 +147,7 @@ module ActiveRecord
         end
       end
 
-      def exec_cache(sql, name, binds)
-        materialize_transactions
-        mark_transaction_written_if_write(sql)
-        update_typemap_for_default_timezone
-        stmt_key = prepare_statement(sql, binds)
-        type_casted_binds = type_casted_binds(binds)
 
-        log(sql, name, binds, type_casted_binds, stmt_key) do
-          ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
-            if is_pipeline_mode?
-              @connection.send_query_prepared(stmt_key, type_casted_binds)
-              future_result = FutureResult.new(self, sql, binds)
-              @counter += 1
-              @piped_results << future_result
-              future_result
-            else
-              @connection.exec_prepared(stmt_key, type_casted_binds)
-            end
-          end
-        end
-      rescue ActiveRecord::StatementInvalid => e
-        raise unless is_cached_plan_failure?(e)
-
-        # Nothing we can do if we are in a transaction because all commands
-        # will raise InFailedSQLTransaction
-        if in_transaction?
-          raise ActiveRecord::PreparedStatementCacheExpired.new(e.cause.message)
-        else
-          @lock.synchronize do
-            # outside of transactions we can simply flush this query and retry
-            @statements.delete sql_key(sql)
-          end
-          retry
-        end
-      end
 
       # def active?
       #   # Need to implement
@@ -240,6 +211,10 @@ module ActiveRecord
             handle_pipeline_error(e, future_result)
           end
         end
+      end
+
+      def push_to_piped_results(future_result)
+        @piped_results << future_result
       end
 
       def is_cached_plan_failure?(pgerror)
@@ -318,6 +293,59 @@ module ActiveRecord
 
       private
 
+      def __submit_exec_no_cache(sql, name, binds)
+        materialize_transactions
+        mark_transaction_written_if_write(sql)
+
+        # make sure we carry over any changes to ActiveRecord::Base.default_timezone that have been
+        # made since we established the connection
+        update_typemap_for_default_timezone
+
+        type_casted_binds = type_casted_binds(binds)
+        log(sql, name, binds, type_casted_binds) do
+          ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
+            if is_pipeline_mode?
+              #If Pipeline mode return future result objects
+              @connection.send_query_params(sql, type_casted_binds)
+            else
+              @connection.exec_params(sql, type_casted_binds)
+            end
+          end
+        end
+      end
+
+      def __submit_exec_cache(sql, name, binds, future_result: nil)
+        materialize_transactions
+        mark_transaction_written_if_write(sql)
+        update_typemap_for_default_timezone
+        stmt_key = prepare_statement(sql, binds)
+        type_casted_binds = type_casted_binds(binds)
+
+        log(sql, name, binds, type_casted_binds, stmt_key) do
+          ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
+            if is_pipeline_mode?
+              @connection.send_query_prepared(stmt_key, type_casted_binds)
+            else
+              @connection.exec_prepared(stmt_key, type_casted_binds)
+            end
+          end
+        end
+      rescue ActiveRecord::StatementInvalid => e
+        raise unless is_cached_plan_failure?(e)
+
+        # Nothing we can do if we are in a transaction because all commands
+        # will raise InFailedSQLTransaction
+        if in_transaction?
+          raise ActiveRecord::PreparedStatementCacheExpired.new(e.cause.message)
+        else
+          @lock.synchronize do
+            # outside of transactions we can simply flush this query and retry
+            @statements.delete sql_key(sql)
+          end
+          retry
+        end
+      end
+
       MULTIPLE_QUERY = '42601'
       def translate_exception(exception, message:, sql:, binds:)
         return exception unless exception.respond_to?(:result)
@@ -367,8 +395,11 @@ module ActiveRecord
             # outside of transactions we can simply flush this query and retry
             @statements.delete sql_key(future_result.sql)
           end
+          # raise activerecord_error
+          future_result.resubmit
+          push_to_piped_results(future_result)
+          initialize_results(future_result)
         end
-        raise activerecord_error
       end
 
       def get_pipelined_result

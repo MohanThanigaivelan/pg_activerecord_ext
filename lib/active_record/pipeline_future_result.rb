@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 module ActiveRecord
   class FutureResult # :nodoc:
-    attr_accessor :block, :sql, :binds, :execution_stack, :error
+    attr_accessor :block, :sql, :binds, :execution_stack, :error, :retry_method, :retry_args, :retry_object
 
     RESULT_TYPES = [ ActiveRecord::Result, Array , Integer]
 
@@ -13,7 +13,7 @@ module ActiveRecord
     #wrapping_methods.delete(:is_a?)
     wrapping_methods.each do |method|
       define_method(method) do |*args, &block|
-        result if @pending
+        result
         @result.send(method, *args, &block)
       end
     end
@@ -33,6 +33,10 @@ module ActiveRecord
     end
 
     def result
+      if @error
+        resubmit
+        @connection_adapter.push_to_piped_results(self)
+      end
       # Wait till timeout until pending is false
       return @result unless @pending
 
@@ -40,6 +44,12 @@ module ActiveRecord
       @result
     end
 
+    def resubmit
+      retry_object.send(retry_method, *retry_args)
+      @result = nil
+      @error = nil
+      @pending = true
+    end
     def assign(result)
       @result = result
       @result = @block.call(result) if @block
