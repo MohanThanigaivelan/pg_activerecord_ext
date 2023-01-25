@@ -30,7 +30,7 @@ module ActiveRecord
       return load if !connection.is_pipeline_mode?
       unless loaded?
 
-        result = exec_main_query
+        result = exec_main_query(async: true)
 
         if result.class == Array
           @records = result
@@ -76,7 +76,7 @@ module ActiveRecord
 
     private
 
-    def exec_main_query
+    def exec_main_query(async: false)
       skip_query_cache_if_necessary do
         if where_clause.contradiction?
           []
@@ -87,11 +87,11 @@ module ActiveRecord
             else
               relation = join_dependency.apply_column_aliases(relation)
               @_join_dependency = join_dependency
-              connection.select_all(relation.arel, "SQL")
+              connection.select_all(relation.arel, "SQL", async: async)
             end
           end
         else
-          klass._query_by_sql(arel)
+          klass._query_by_sql(arel, async: async)
         end
       end
     end

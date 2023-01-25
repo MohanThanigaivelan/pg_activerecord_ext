@@ -3,8 +3,8 @@
 module ActiveRecord
   module Querying
 
-    def _query_by_sql(sql, binds = [], preparable: nil) # :nodoc:
-      connection.select_all(sanitize_sql(sql), "#{name} Load", binds, preparable: preparable)
+    def _query_by_sql(sql, binds = [], preparable: nil, async: false) # :nodoc:
+      connection.select_all(sanitize_sql(sql), "#{name} Load", binds, preparable: preparable, async: async)
     end
 
     def _load_from_sql(result_set, &block) # :nodoc:
