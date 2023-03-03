@@ -357,6 +357,7 @@ module ActiveRecord
 
       def handle_pipeline_error(exception, future_result)
         activerecord_error = translate_exception_class(exception, future_result.sql, future_result.binds)
+        # Refactor needed
         begin
           raise activerecord_error
         rescue ActiveRecordError => exp
