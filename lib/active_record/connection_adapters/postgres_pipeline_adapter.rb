@@ -56,8 +56,11 @@ module ActiveRecord
 
       def reconnect!
         initialize_results(nil) if active? && @piped_results.count > 0
-        super
+        #TODO Assign errors for the pending future results
+        @piped_results.clear
+        result = super
         @connection.enter_pipeline_mode
+        result
       end
 
       def disconnect!
@@ -81,44 +84,33 @@ module ActiveRecord
 
 
       def exec_no_cache(sql, name, binds)
-        result = __submit_exec_no_cache(sql, name, binds)
-        if is_pipeline_mode?
-          future_result = FutureResult.new(self, sql, binds)
-          future_result.retry_object = self
-          future_result.retry_args = [sql , name, binds]
-          future_result.retry_method = :__submit_exec_no_cache
-          @counter += 1
-          push_to_piped_results(future_result)
-          future_result
-        else
-          result
-        end
-      end
+        materialize_transactions
+        mark_transaction_written_if_write(sql)
 
-      def exec_cache(sql, name, binds)
-        result = __submit_exec_cache(sql, name, binds)
-        if is_pipeline_mode?
-          future_result = FutureResult.new(self, sql, binds)
-          future_result.retry_object = self
-          future_result.retry_args = [sql, name, binds]
-          future_result.retry_method = :__submit_exec_cache
-          @counter += 1
-          push_to_piped_results(future_result)
-          future_result
-        else
-          result
+        # make sure we carry over any changes to ActiveRecord::Base.default_timezone that have been
+        # made since we established the connection
+        update_typemap_for_default_timezone
+
+        type_casted_binds = type_casted_binds(binds)
+        log(sql, name, binds, type_casted_binds) do
+          ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
+            if is_pipeline_mode?
+              #If Pipeline mode return future result objects
+              @connection.send_query_params(sql, type_casted_binds)
+              @connection.pipeline_sync
+              future_result = FutureResult.new(self, sql, binds)
+              @counter += 1
+              @piped_results << future_result
+              future_result
+            else
+              @connection.exec_params(sql, type_casted_binds)
+            end
+          end
         end
       end
 
       def pipeline_fetch(future_result)
-        @instrumenter.instrument('sql.active_record', sql: "FETCHING PIPELINE RESULT TILL #{future_result.sql}",
-                                                      name: 'PIPELINE_FETCH',
-                                                      binds: [],
-                                                      type_casted_binds: [],
-                                                      statement_name: nil,
-                                                      connection: self) do
-          initialize_results(future_result)
-        end
+        initialize_results(future_result)
       end
 
       def prepare_statement(sql, binds)
@@ -147,6 +139,54 @@ module ActiveRecord
         end
       end
 
+      def exec_cache(sql, name, binds)
+        materialize_transactions
+        mark_transaction_written_if_write(sql)
+        update_typemap_for_default_timezone
+        stmt_key = prepare_statement(sql, binds)
+        type_casted_binds = type_casted_binds(binds)
+
+        log(sql, name, binds, type_casted_binds, stmt_key) do
+          ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
+            if is_pipeline_mode?
+              @connection.send_query_prepared(stmt_key, type_casted_binds)
+              @connection.pipeline_sync
+              future_result = FutureResult.new(self, sql, binds)
+              future_result.on_error do |exp|
+                handle_exec_cache(exp, sql, future_result)
+              end
+              @counter += 1
+              @piped_results << future_result
+              future_result
+            else
+              @connection.exec_prepared(stmt_key, type_casted_binds)
+            end
+          end
+        end
+      rescue ActiveRecord::StatementInvalid => e
+        handle_exec_cache(e, sql)
+      end
+
+      def handle_exec_cache(exp, sql, future_result: nil)
+        raise unless is_cached_plan_failure?(e)
+
+        # Nothing we can do if we are in a transaction because all commands
+        # will raise InFailedSQLTransaction
+        if in_transaction?
+          raise ActiveRecord::PreparedStatementCacheExpired.new(e.cause.message)
+        else
+          @lock.synchronize do
+            # outside of transactions we can simply flush this query and retry
+            @statements.delete sql_key(sql)
+          end
+          new_result = exec_cache(sql, name, binds)
+          if new_result.class == ActiveRecord::FutureResult && future_result
+            future_result.set_result(new_result.result)
+          else
+            new_result
+          end
+        end
+      end
 
 
       # def active?
@@ -159,8 +199,16 @@ module ActiveRecord
           flush_pipeline_and_get_sync_result { @connection.send_query_params 'SELECT 1' , [] }
         end
         true
-      rescue PG::Error
-        false
+      rescue => exception
+        return false if exception.is_a?(PG::Error)||exception.cause.is_a?(PG::Error)
+        raise
+      end
+
+      def active!
+        # Is this connection alive and ready for queries?
+        @lock.synchronize do
+          flush_pipeline_and_get_sync_result { @connection.send_query_params 'SELECT 1' , [] }
+        end
       end
 
       def request_in_error(result_status)
@@ -178,12 +226,16 @@ module ActiveRecord
       ENDLESS_LOOP_SECONDS = 20
       def initialize_results(required_future_result)
         @lock.synchronize do
-          @connection.pipeline_sync
           time_since_last_result = Time.now
           future_result = nil
           begin
             loop do
-              result = @connection.get_result
+              begin
+                result  = @connection.get_result
+              rescue PG::Error
+                future_result = @piped_results.shift
+                raise
+              end
               if response_received(result)
                 time_since_last_result = Time.now
                 future_result = @piped_results.shift
@@ -197,7 +249,7 @@ module ActiveRecord
               elsif request_in_error(result.try(:result_status))
                 future_result = @piped_results.shift
                 @logger.error "Raising error because future for query #{future_result.sql} called at stack : #{future_result.execution_stack} gave result #{result.try(:result_status)}"
-                raise PipelineError.new(result.error_message, result)
+                result.check
               elsif request_in_aborted(result.try(:result_status))
                 future_result = @piped_results.shift
                 future_result.assign_error(PriorQueryPipelineError.new('A previous query has made the pipeline in aborted state', result))
@@ -207,14 +259,10 @@ module ActiveRecord
                 @logger.debug "Seems like an endless loop with Pipeline Sync status #{pipeline_in_sync?(result)}, piped results size : #{@piped_results.count}, connection pipeline : #{@connection.inspect} , result :#{result.inspect}"
               end
             end
-          rescue ActiveRecord::PipelineError => e
+          rescue PG::Error => e
             handle_pipeline_error(e, future_result)
           end
         end
-      end
-
-      def push_to_piped_results(future_result)
-        @piped_results << future_result
       end
 
       def is_cached_plan_failure?(pgerror)
@@ -278,13 +326,14 @@ module ActiveRecord
         def dealloc(key)
           @adapter.flush_pipeline_and_get_sync_result { @connection.send_query_params "DEALLOCATE #{key}", [] } if connection_active?
           # @connection.query "DEALLOCATE #{key}"
-        rescue PG::Error
+        rescue PG::Error => e
+          @logger.error("In postgres adapter dealloc method recieved PG error #{e}")
         end
       end
 
       def flush_pipeline_and_get_sync_result
         @lock.synchronize do
-          initialize_results(nil)
+          initialize_results(nil) if @piped_results.length > 0
           yield
           @connection.pipeline_sync
           get_pipelined_result
@@ -292,71 +341,6 @@ module ActiveRecord
       end
 
       private
-
-      def __submit_exec_no_cache(sql, name, binds)
-        materialize_transactions
-        mark_transaction_written_if_write(sql)
-
-        # make sure we carry over any changes to ActiveRecord::Base.default_timezone that have been
-        # made since we established the connection
-        update_typemap_for_default_timezone
-
-        type_casted_binds = type_casted_binds(binds)
-        log(sql, name, binds, type_casted_binds) do
-          ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
-            if is_pipeline_mode?
-              #If Pipeline mode return future result objects
-              @connection.send_query_params(sql, type_casted_binds)
-            else
-              @connection.exec_params(sql, type_casted_binds)
-            end
-          end
-        end
-      end
-
-      def __submit_exec_cache(sql, name, binds, future_result: nil)
-        materialize_transactions
-        mark_transaction_written_if_write(sql)
-        update_typemap_for_default_timezone
-        stmt_key = prepare_statement(sql, binds)
-        type_casted_binds = type_casted_binds(binds)
-
-        log(sql, name, binds, type_casted_binds, stmt_key) do
-          ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
-            if is_pipeline_mode?
-              @connection.send_query_prepared(stmt_key, type_casted_binds)
-            else
-              @connection.exec_prepared(stmt_key, type_casted_binds)
-            end
-          end
-        end
-      rescue ActiveRecord::StatementInvalid => e
-        raise unless is_cached_plan_failure?(e)
-
-        # Nothing we can do if we are in a transaction because all commands
-        # will raise InFailedSQLTransaction
-        if in_transaction?
-          raise ActiveRecord::PreparedStatementCacheExpired.new(e.cause.message)
-        else
-          @lock.synchronize do
-            # outside of transactions we can simply flush this query and retry
-            @statements.delete sql_key(sql)
-          end
-          retry
-        end
-      end
-
-      MULTIPLE_QUERY = '42601'
-      def translate_exception(exception, message:, sql:, binds:)
-        return exception unless exception.respond_to?(:result)
-
-        case exception.result.try(:error_field, PG::PG_DIAG_SQLSTATE)
-        when MULTIPLE_QUERY
-          MultipleQueryError.new(message)
-        else
-          super
-        end
-      end
 
       def pipeline_in_sync?(result)
         result.try(:result_status) == PG::PGRES_PIPELINE_SYNC
@@ -384,22 +368,8 @@ module ActiveRecord
       def handle_pipeline_error(exception, future_result)
         activerecord_error = translate_exception_class(exception, future_result.sql, future_result.binds)
         future_result.assign_error(activerecord_error)
-        raise activerecord_error unless is_cached_plan_failure?(exception)
+        #raise activerecord_error unless is_cached_plan_failure?(exception)
 
-        # Nothing we can do if we are in a transaction because all commands
-        # will raise InFailedSQLTransaction
-        if in_transaction?
-          raise ActiveRecord::PreparedStatementCacheExpired.new(exception.message)
-        else
-          @lock.synchronize do
-            # outside of transactions we can simply flush this query and retry
-            @statements.delete sql_key(future_result.sql)
-          end
-          # raise activerecord_error
-          future_result.resubmit
-          push_to_piped_results(future_result)
-          initialize_results(future_result)
-        end
       end
 
       def get_pipelined_result
@@ -413,7 +383,7 @@ module ActiveRecord
           elsif transaction_in_error?(@connection.transaction_status)
             break
           elsif request_in_error(interim_result.try(:result_status))
-            raise PipelineError.new(interim_result.error_message, interim_result)
+            interim_result.check
           elsif request_in_aborted(interim_result.try(:result_status))
             @logger.warn 'Not expecting pipeline to go in aborted state, as everything is flushed'
           elsif ((Time.now - time_since_last_result) % ENDLESS_LOOP_SECONDS).zero?

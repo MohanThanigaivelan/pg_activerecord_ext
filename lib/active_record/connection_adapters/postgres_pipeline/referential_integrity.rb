@@ -41,7 +41,8 @@ Rails needs superuser privileges to disable referential integrity.
               end
               # execute(tables.collect { |name| "ALTER TABLE #{quote_table_name(name)} ENABLE TRIGGER ALL" }.join(";"))
             end
-          rescue ActiveRecord::ActiveRecordError
+          rescue ActiveRecord::ActiveRecordError => e
+            @logger.error("While enabling referential integrity recieved error #{e}")
           end
         end
       end

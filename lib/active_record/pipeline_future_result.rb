@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 module ActiveRecord
   class FutureResult # :nodoc:
-    attr_accessor :block, :sql, :binds, :execution_stack, :error, :retry_method, :retry_args, :retry_object
+    attr_accessor :block, :sql, :binds, :execution_stack, :error, :exception_block
 
     RESULT_TYPES = [ ActiveRecord::Result, Array , Integer]
 
@@ -13,7 +13,7 @@ module ActiveRecord
     #wrapping_methods.delete(:is_a?)
     wrapping_methods.each do |method|
       define_method(method) do |*args, &block|
-        result
+        result if @pending
         @result.send(method, *args, &block)
       end
     end
@@ -29,14 +29,11 @@ module ActiveRecord
       @binds = binds
       @creation_time = Time.now
       @resolved_time = nil
+      @exception_block = []
       @execution_stack = caller(1, 100)
     end
 
     def result
-      if @error
-        resubmit
-        @connection_adapter.push_to_piped_results(self)
-      end
       # Wait till timeout until pending is false
       return @result unless @pending
 
@@ -44,12 +41,6 @@ module ActiveRecord
       @result
     end
 
-    def resubmit
-      retry_object.send(retry_method, *retry_args)
-      @result = nil
-      @error = nil
-      @pending = true
-    end
     def assign(result)
       @result = result
       @result = @block.call(result) if @block
@@ -57,10 +48,37 @@ module ActiveRecord
       @resolved_time = Time.now
     end
 
+    def set_result(result)
+      @result = result
+      @pending = false
+      @resolved_time = Time.now
+      self
+    end
+
+    def on_error(&block)
+      @exception_block << block
+    end
+
+    def execute_on_error(exp)
+      current_exp = exp
+      @exception_block.each do |block|
+        begin
+          block.call(current_exp)
+          current_exp = nil
+          break
+        rescue StandardError => e
+          current_exp = e
+        end
+      end
+      raise current_exp if current_exp
+    end
+
+
     def assign_error(error)
       @error = error
       @resolved_time = Time.now
       @pending = false
+      execute_on_error(error)
     end
 
     def ==(other)
