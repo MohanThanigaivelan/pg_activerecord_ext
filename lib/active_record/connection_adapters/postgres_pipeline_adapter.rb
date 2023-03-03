@@ -153,7 +153,7 @@ module ActiveRecord
               @connection.pipeline_sync
               future_result = FutureResult.new(self, sql, binds)
               future_result.on_error do |exp|
-                handle_exec_cache(exp, sql, future_result)
+                handle_exec_cache(exp, sql, name, binds, future_result: future_result)
               end
               @counter += 1
               @piped_results << future_result
@@ -164,16 +164,16 @@ module ActiveRecord
           end
         end
       rescue ActiveRecord::StatementInvalid => e
-        handle_exec_cache(e, sql)
+        handle_exec_cache(e, sql, name, binds)
       end
 
-      def handle_exec_cache(exp, sql, future_result: nil)
-        raise unless is_cached_plan_failure?(e)
+      def handle_exec_cache(exp, sql, name, binds, future_result: nil)
+        raise unless is_cached_plan_failure?(exp)
 
         # Nothing we can do if we are in a transaction because all commands
         # will raise InFailedSQLTransaction
         if in_transaction?
-          raise ActiveRecord::PreparedStatementCacheExpired.new(e.cause.message)
+          raise ActiveRecord::PreparedStatementCacheExpired.new(exp.cause.message)
         else
           @lock.synchronize do
             # outside of transactions we can simply flush this query and retry
@@ -181,7 +181,7 @@ module ActiveRecord
           end
           new_result = exec_cache(sql, name, binds)
           if new_result.class == ActiveRecord::FutureResult && future_result
-            future_result.set_result(new_result.result)
+            future_result.assign(new_result.result)
           else
             new_result
           end
@@ -227,15 +227,11 @@ module ActiveRecord
       def initialize_results(required_future_result)
         @lock.synchronize do
           time_since_last_result = Time.now
+          result = nil
           future_result = nil
           begin
             loop do
-              begin
-                result  = @connection.get_result
-              rescue PG::Error
-                future_result = @piped_results.shift
-                raise
-              end
+              result = @connection.get_result
               if response_received(result)
                 time_since_last_result = Time.now
                 future_result = @piped_results.shift
@@ -247,8 +243,7 @@ module ActiveRecord
                 @logger.error "Transaction status in error #{@connection.transaction_status}, expecting the status to cleaned up in next pipeline invocation"
                 break
               elsif request_in_error(result.try(:result_status))
-                future_result = @piped_results.shift
-                @logger.error "Raising error because future for query #{future_result.sql} called at stack : #{future_result.execution_stack} gave result #{result.try(:result_status)}"
+                #  future_result = @piped_results.shift
                 result.check
               elsif request_in_aborted(result.try(:result_status))
                 future_result = @piped_results.shift
@@ -260,16 +255,11 @@ module ActiveRecord
               end
             end
           rescue PG::Error => e
+            future_result = @piped_results.shift
+            @logger.error "Raising error because future for query #{future_result.sql} called at stack : #{future_result.execution_stack} gave result #{result.try(:result_status)}"
             handle_pipeline_error(e, future_result)
           end
         end
-      end
-
-      def is_cached_plan_failure?(pgerror)
-        pgerror.result.result_error_field(PG::PG_DIAG_SQLSTATE) == FEATURE_NOT_SUPPORTED &&
-          pgerror.result.result_error_field(PG::PG_DIAG_SOURCE_FUNCTION) == 'RevalidateCachedQuery'
-      rescue
-        false
       end
 
 
@@ -367,6 +357,11 @@ module ActiveRecord
 
       def handle_pipeline_error(exception, future_result)
         activerecord_error = translate_exception_class(exception, future_result.sql, future_result.binds)
+        begin
+          raise activerecord_error
+        rescue ActiveRecordError => exp
+          activerecord_error = exp
+        end
         future_result.assign_error(activerecord_error)
         #raise activerecord_error unless is_cached_plan_failure?(exception)
 
