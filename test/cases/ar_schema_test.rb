@@ -19,11 +19,7 @@ class ActiveRecordSchemaTest < ActiveRecord::TestCase
     @connection.drop_table :nep_schema_migrations rescue nil
     @connection.drop_table :has_timestamps rescue nil
     @connection.drop_table :multiple_indexes rescue nil
-    if current_adapter?(:PostgresPipelineAdapter)
-      @schema_migration.delete_all.result rescue nil
-    else
-      @schema_migration.delete_all rescue nil
-    end
+    @schema_migration.delete_all rescue nil
     ActiveRecord::Migration.verbose = @original_verbose
   end
 

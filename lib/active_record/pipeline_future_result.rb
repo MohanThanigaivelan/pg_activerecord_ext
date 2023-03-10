@@ -3,11 +3,11 @@ module ActiveRecord
   class FutureResult # :nodoc:
     attr_accessor :block, :sql, :binds, :execution_stack, :error, :exception_block
 
-    RESULT_TYPES = [ ActiveRecord::Result, Array , Integer]
+    RESULT_TYPES = [ ActiveRecord::Result, Array , Integer].freeze
 
-    rejection_methods = [Kernel].inject([]){ |result, klass| result + klass.instance_methods }
+    rejection_methods = [Kernel].inject([]) { |result, klass| result + klass.instance_methods }
 
-    wrapping_methods = (RESULT_TYPES.inject([]) { |result, klass| result + klass.instance_methods } - [:==] - rejection_methods + [:dup, :pluck, :is_a?, :instance_of?, :kind_of?] ).uniq
+    wrapping_methods = (RESULT_TYPES.inject([]) { |result, klass| result + klass.instance_methods } - [:==] - rejection_methods + [:dup, :pluck, :is_a?, :instance_of?, :kind_of?, :tap]).uniq
     # TODO : Fix logic of rejection methods to reject below 2 functions as well
     wrapping_methods.delete(:__send__)
     #wrapping_methods.delete(:is_a?)
@@ -62,12 +62,14 @@ module ActiveRecord
     def execute_on_error(exp)
       current_exp = exp
       @exception_block.each do |block|
-        begin
-          block.call(current_exp)
-          current_exp = nil
-          break
-        rescue StandardError => e
-          current_exp = e
+        if block
+           begin
+            block.call(current_exp)
+            current_exp = nil
+            break
+           rescue StandardError => e
+            current_exp = e
+           end
         end
       end
       raise current_exp if current_exp

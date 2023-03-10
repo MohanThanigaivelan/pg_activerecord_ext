@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
-require 'active_record/connection_adapters/postgresql_adapter'
-require 'active_record/pipeline_future_result'
-require 'active_record/connection_adapters/postgres_pipeline/pipeline_database_statements'
-require 'active_record/connection_adapters/postgres_pipeline/referential_integrity'
-require 'active_record/pipeline_errors'
+require "active_record/connection_adapters/postgresql_adapter"
+require "active_record/pipeline_future_result"
+require "active_record/connection_adapters/postgres_pipeline/pipeline_database_statements"
+require "active_record/connection_adapters/postgres_pipeline/referential_integrity"
+require "active_record/pipeline_errors"
 
 module ActiveRecord
   module ConnectionHandling # :nodoc:
@@ -27,7 +27,7 @@ module ActiveRecord
 
     # Establishes a connection to the database of postgres with pipeline support
     class PostgresPipelineAdapter < ActiveRecord::ConnectionAdapters::PostgreSQLAdapter
-      ADAPTER_NAME = 'PostgresPipeline'
+      ADAPTER_NAME = "PostgresPipeline"
 
       include PostgresPipeline::DatabaseStatements
       include PostgresPipeline::ReferentialIntegrity
@@ -73,10 +73,10 @@ module ActiveRecord
           clear_cache!
           reset_transaction
           unless @connection.transaction_status == ::PG::PQTRANS_IDLE
-            flush_pipeline_and_get_sync_result { @connection.send_query_params 'ROLLBACK', [] }
+            flush_pipeline_and_get_sync_result { @connection.send_query_params "ROLLBACK", [] }
             #  @connection.query "ROLLBACK"
           end
-          flush_pipeline_and_get_sync_result { @connection.send_query_params 'DISCARD ALL', [] }
+          flush_pipeline_and_get_sync_result { @connection.send_query_params "DISCARD ALL", [] }
           # @connection.query "DISCARD ALL"
           configure_connection
         end
@@ -202,7 +202,7 @@ module ActiveRecord
 
       def active?
         @lock.synchronize do
-          flush_pipeline_and_get_sync_result { @connection.send_query_params 'SELECT 1' , [] }
+          flush_pipeline_and_get_sync_result { @connection.send_query_params "SELECT 1" , [] }
         end
         true
       rescue => exception
@@ -213,7 +213,7 @@ module ActiveRecord
       def active!
         # Is this connection alive and ready for queries?
         @lock.synchronize do
-          flush_pipeline_and_get_sync_result { @connection.send_query_params 'SELECT 1' , [] }
+          flush_pipeline_and_get_sync_result { @connection.send_query_params "SELECT 1" , [] }
         end
       end
 
@@ -250,7 +250,7 @@ module ActiveRecord
               result.check
             elsif request_in_aborted(result.try(:result_status))
               @current_future_result = @piped_results.shift
-              @current_future_result.assign_error(PriorQueryPipelineError.new('A previous query has made the pipeline in aborted state', result))
+              @current_future_result.assign_error(PriorQueryPipelineError.new("A previous query has made the pipeline in aborted state", result))
               @logger.info "Setting PriorQueryPipelineError for sql #{@current_future_result.sql} called at stack : #{@current_future_result.execution_stack}"
               break if required_future_result == @current_future_result
             elsif (Time.now - time_since_last_result).to_i > ENDLESS_LOOP_SECONDS
@@ -263,7 +263,6 @@ module ActiveRecord
           raise translate_exception_class(e, @current_future_result.sql, @current_future_result.binds)
         end
       end
-
 
       def execute_and_clear(sql, name, binds, prepare: false, &block)
         if preventing_writes? && write_query?(sql)
@@ -292,7 +291,7 @@ module ActiveRecord
         ret
       end
 
-      def exec_query(sql, name = 'SQL', binds = [], prepare: false)
+      def exec_query(sql, name = "SQL", binds = [], prepare: false)
         execute_and_clear(sql, name, binds, prepare: prepare) do |result|
           if !result.is_a?(FutureResult)
             build_ar_result(result)
@@ -370,7 +369,7 @@ module ActiveRecord
           elsif request_in_error(interim_result.try(:result_status))
             interim_result.check
           elsif request_in_aborted(interim_result.try(:result_status))
-            @logger.warn 'Not expecting pipeline to go in aborted state, as everything is flushed'
+            @logger.warn "Not expecting pipeline to go in aborted state, as everything is flushed"
           elsif ((Time.now - time_since_last_result) % ENDLESS_LOOP_SECONDS).zero?
             @logger.debug "Seems like an endless loop with Pipeline Sync status #{pipeline_in_sync?(result)}, connection pipeline : #{@connection.inspect} , result :#{interim_result.inspect}"
           end
@@ -379,8 +378,8 @@ module ActiveRecord
         result
       end
 
-      ActiveRecord::Type.add_modifier({ array: true }, OID::Array, adapter: :postgrespipeline)
-      ActiveRecord::Type.add_modifier({ range: true }, OID::Range, adapter: :postgrespipeline)
+      ActiveRecord::Type.add_modifier({array: true}, OID::Array, adapter: :postgrespipeline)
+      ActiveRecord::Type.add_modifier({range: true}, OID::Range, adapter: :postgrespipeline)
       ActiveRecord::Type.register(:bit, OID::Bit, adapter: :postgrespipeline)
       ActiveRecord::Type.register(:bit_varying, OID::BitVarying, adapter: :postgrespipeline)
       ActiveRecord::Type.register(:binary, OID::Bytea, adapter: :postgrespipeline)
