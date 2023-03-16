@@ -26,16 +26,17 @@ module ActiveRecord
       self
     end
 
-    def load_in_pipeline
+    def load_in_pipeline(exp_block: nil)
       return load if !connection.is_pipeline_mode?
       unless loaded?
 
         result = exec_main_query
 
-        if result.class == Array
-          @records = result
-        else
+        if result.class == ActiveRecord::FutureResult
           @future_result = result
+          @future_result.on_error(&exp_block) if exp_block
+        else
+          @records = result
         end
         @loaded = true
       end

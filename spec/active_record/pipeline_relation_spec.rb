@@ -141,4 +141,17 @@ RSpec.describe 'ActiveRecord::Relation' do
       expect(users.instance_variable_get(:@future_result).class).to eq(ActiveRecord::FutureResult)
     end
   end
+
+  it "should set exception_block to future_result" do
+    ActiveRecord::Base.establish_connection("adapter" => "postgres_pipeline")
+    ActiveRecord::Base.connection
+    ActiveSupport::Notifications.subscribed( @callback, "sql.active_record") do
+      exception_caught = false
+      exception_proc = Proc.new{ exception_caught = true }
+      expect_any_instance_of(PG::Connection).to receive(:get_result).and_raise(PG::Error)
+      users = User.where("id is not null").load_in_pipeline(exp_block: exception_proc)
+      expect{ users.to_a }.not_to raise_exception(ActiveRecord::StatementInvalid)
+      expect(exception_caught).to eq(true)
+    end
+  end
 end

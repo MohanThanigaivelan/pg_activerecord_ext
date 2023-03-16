@@ -57,6 +57,7 @@ module ActiveRecord
 
     def on_error(&block)
       @exception_block << block
+      self
     end
 
     def execute_on_error(exp)
