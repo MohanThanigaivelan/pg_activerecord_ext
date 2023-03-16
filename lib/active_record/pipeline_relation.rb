@@ -97,6 +97,16 @@ module ActiveRecord
       end
     end
 
+    def reset
+      @delegate_to_klass = false
+      @to_sql = @arel = @loaded = @should_eager_load = nil
+      @offsets = @take = nil
+      @cache_keys = nil
+      @records = [].freeze
+      @future_result = nil
+      self
+    end
+
     def instantiate_records(rows, &block)
       return [].freeze if rows.empty?
       if eager_loading?

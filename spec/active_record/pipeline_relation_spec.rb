@@ -154,4 +154,13 @@ RSpec.describe 'ActiveRecord::Relation' do
       expect(exception_caught).to eq(true)
     end
   end
+
+  it "should resubmit the query when reload is called" do
+    ActiveRecord::Base.establish_connection("adapter" => "postgres_pipeline")
+    ActiveSupport::Notifications.subscribed( @callback, "sql.active_record") do
+      users = User.where("id is not null").load_in_pipeline
+      User.create(id: 5)
+      expect(users.reload.to_a.count).to eq(3)
+    end
+  end
 end
