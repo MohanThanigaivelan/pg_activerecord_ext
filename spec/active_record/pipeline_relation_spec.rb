@@ -39,6 +39,16 @@ RSpec.describe 'ActiveRecord::Relation' do
     end
   end
 
+  it 'should clear PG Result after resolving future result' do
+    ActiveRecord::Base.establish_connection("adapter" => "postgres_pipeline")
+    ActiveRecord::Base.connection
+    expect_any_instance_of(PG::Result).to receive(:clear).and_call_original
+    ActiveSupport::Notifications.subscribed( @callback, "sql.active_record") do
+      users = User.where("id is not null").load_in_pipeline
+      users.to_a
+    end
+  end
+
   it 'should fetch results for where clause in pipeline mode even when load_in_pipeline is not explicity called' do
     ActiveRecord::Base.establish_connection("adapter" => "postgres_pipeline")
     ActiveSupport::Notifications.subscribed( @callback, "sql.active_record") do

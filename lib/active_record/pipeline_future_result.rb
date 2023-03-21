@@ -43,7 +43,10 @@ module ActiveRecord
 
     def assign(result)
       @result = result
-      @result = @block.call(result) if @block
+      if @block
+        @result = @block.call(result)
+        result.clear
+      end
       @pending = false
       @resolved_time = Time.now
     end
