@@ -18,6 +18,10 @@ RSpec.describe 'ActiveRecord::ConnectionAdapters::PostgresPipelineAdapter' do
     @connection.exec_insert('insert into postgresql_pipeline_test_table (number) VALUES (1)', nil, [], 'id', 'postgresql_pipeline_test_table_id_seq')
   end
 
+  before(:each) do
+    @pipeline_connection.discard_results
+  end
+
   it 'should create pipeline connection with encoding' do
     pipeline_connection = ActiveRecord::Base.postgres_pipeline_connection({min_messages: 'warning', encoding: 'unicode'})
     raw_conn = pipeline_connection.instance_variable_get(:@connection)
@@ -66,14 +70,12 @@ RSpec.describe 'ActiveRecord::ConnectionAdapters::PostgresPipelineAdapter' do
     end
 
     it 'should return fatal error on executing multiple SQL statements' do
-      pipeline_conn = ActiveRecord::Base.postgres_pipeline_connection(min_messages: 'warning')
-      expect {pipeline_conn.execute("select max(id) from postgresql_pipeline_test_table; SHOW TIME ZONE;")}
+      expect {@pipeline_connection.execute("select max(id) from postgresql_pipeline_test_table; SHOW TIME ZONE;")}
         .to raise_error(ActiveRecord::StatementInvalid, /cannot insert multiple commands into a prepared statement/)
     end
 
     it 'should initialize execution stack in future result creation' do
-      pipeline_conn = ActiveRecord::Base.postgres_pipeline_connection(min_messages: 'warning')
-      future_result = pipeline_conn.exec_query("select max(id) from postgresql_pipeline_test_table")
+      future_result = @pipeline_connection.exec_query("select max(id) from postgresql_pipeline_test_table")
       expect(future_result.execution_stack).not_to be_nil
     end
 
@@ -95,6 +97,18 @@ RSpec.describe 'ActiveRecord::ConnectionAdapters::PostgresPipelineAdapter' do
       expect(future_result_first.result.rows.length).to be(1)
       expect(future_result_third.result).to be_nil
       expect(future_result_third.error).to be_a_kind_of(ActiveRecord::PriorQueryPipelineError)
+    end
+  end
+
+  context "#discard_results" do
+    it "should clear piped_result and discard all pending results in the connection" do
+      @pipeline_connection.exec_query('select max(id) from postgresql_pipeline_test_table')
+      @pipeline_connection.exec_query('select min(id) from postgresql_pipeline_test_table')
+      pipeline_con = @pipeline_connection.raw_connection
+      piped_results = @pipeline_connection.instance_variable_get(:@piped_results)
+      expect(@pipeline_connection.logger).to receive(:debug).with("2 result(s) have been discarded")
+      expect(pipeline_con).to receive(:discard_results).exactly(4).times.and_call_original
+      expect { @pipeline_connection.discard_results }.to change { piped_results.try(:length) }.from(2).to(0)
     end
   end
 

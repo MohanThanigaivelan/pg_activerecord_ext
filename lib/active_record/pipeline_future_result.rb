@@ -44,8 +44,11 @@ module ActiveRecord
     def assign(result)
       @result = result
       if @block
-        @result = @block.call(result)
-        result.clear
+        begin
+          @result = @block.call(result)
+        ensure
+          result.clear
+        end
       end
       @pending = false
       @resolved_time = Time.now

@@ -15,7 +15,7 @@ group :test do
   gem 'rubocop-rspec', '~> 2.6'
   gem 'simplecov', '~> 0.16'
   gem 'vcr', '~> 6.1'
-  gem "pg", "~> 1.1"
+  gem "pg", "~> 1.4.6"
   gem "byebug"
   gem "sqlite3"
 end

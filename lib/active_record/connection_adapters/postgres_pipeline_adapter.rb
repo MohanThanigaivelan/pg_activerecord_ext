@@ -63,6 +63,17 @@ module ActiveRecord
         result
       end
 
+      def discard_results
+        pending_sql_count = @piped_results.count
+        @piped_results.clear
+        @lock.synchronize do
+          loop do
+            break unless @connection.discard_results
+          end
+        end
+        @logger&.debug "#{pending_sql_count} result(s) have been discarded" if pending_sql_count > 0
+      end
+
       def disconnect!
         pipeline_fetch(nil) if active? && @piped_results.count > 0
         super
@@ -240,7 +251,10 @@ module ActiveRecord
               time_since_last_result = Time.now
               @current_future_result = @piped_results.shift
               @current_future_result.assign(result)
-              break if required_future_result == @current_future_result && !@piped_results.empty?
+              if required_future_result == @current_future_result && !@piped_results.empty?
+                flush_pipeline_sync
+                break
+              end
             elsif pipeline_in_sync?(result) && @piped_results.empty?
               break
             elsif transaction_in_error?(@connection.transaction_status)
@@ -335,6 +349,11 @@ module ActiveRecord
 
       def pipeline_in_sync?(result)
         result.try(:result_status) == PG::PGRES_PIPELINE_SYNC
+      end
+
+      def flush_pipeline_sync
+        until pipeline_in_sync?(@connection.get_result)
+        end
       end
 
       def response_received(result)
