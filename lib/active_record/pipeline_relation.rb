@@ -29,9 +29,7 @@ module ActiveRecord
     def load_in_pipeline(exp_block: nil)
       return load if !connection.is_pipeline_mode?
       unless loaded?
-
-        result = exec_main_query
-
+        result = exec_main_query(pipeline_async: true)
         if result.class == ActiveRecord::FutureResult
           @future_result = result
           @future_result.on_error(&exp_block) if exp_block
@@ -39,6 +37,7 @@ module ActiveRecord
           @records = result
         end
         @loaded = true
+
       end
       self
     end
@@ -77,7 +76,7 @@ module ActiveRecord
 
     private
 
-    def exec_main_query
+    def exec_main_query(pipeline_async: false)
       skip_query_cache_if_necessary do
         if where_clause.contradiction?
           []
@@ -88,11 +87,11 @@ module ActiveRecord
             else
               relation = join_dependency.apply_column_aliases(relation)
               @_join_dependency = join_dependency
-              connection.select_all(relation.arel, "SQL")
+              connection.select_all(relation.arel, "SQL", pipeline_async: pipeline_async)
             end
           end
         else
-          klass._query_by_sql(arel)
+          klass._query_by_sql(arel, pipeline_async: pipeline_async)
         end
       end
     end

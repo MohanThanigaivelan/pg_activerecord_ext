@@ -44,16 +44,6 @@ module ActiveRecord
         @connection.pipeline_status != PG::PQ_PIPELINE_OFF
       end
 
-      def case_insensitive_comparison(attribute, value) # :nodoc:
-        column = column_for_attribute(attribute)
-
-        if can_perform_case_insensitive_comparison_for?(column).result
-          attribute.lower.eq(attribute.relation.lower(value))
-        else
-          attribute.eq(value)
-        end
-      end
-
       def reconnect!
         pipeline_fetch(nil) if active? && @piped_results.count > 0
         #TODO Assign errors for the pending future results
@@ -94,7 +84,7 @@ module ActiveRecord
       end
 
 
-      def exec_no_cache(sql, name, binds)
+      def exec_no_cache(sql, name, binds, future_result: nil, pipeline_async: false)
         materialize_transactions
         mark_transaction_written_if_write(sql)
 
@@ -107,12 +97,18 @@ module ActiveRecord
           ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
             if is_pipeline_mode?
               #If Pipeline mode return future result objects
-              @connection.send_query_params(sql, type_casted_binds)
-              @connection.pipeline_sync
-              future_result = FutureResult.new(self, sql, binds)
-              @counter += 1
-              @piped_results << future_result
-              future_result
+              if pipeline_async
+                @connection.send_query_params(sql, type_casted_binds)
+                @connection.send_flush_request
+                unless future_result
+                  future_result = FutureResult.new(self, sql, binds)
+                end
+                @counter += 1
+                @piped_results << future_result
+                future_result
+              else
+                flush_pipeline_and_get_sync_result{ @connection.send_query_params(sql, type_casted_binds) }
+              end
             else
               @connection.exec_params(sql, type_casted_binds)
             end
@@ -125,7 +121,15 @@ module ActiveRecord
           begin
             initialize_results(future_result)
           rescue ActiveRecordError => exp
-            @current_future_result.assign_error(exp)
+            future = @current_future_result
+            puts @piped_results.count
+            aborted_results = @piped_results.dup
+            initialize_results(nil) if @piped_results.count > 0
+            future.assign_error(exp)
+            aborted_results.each do |future_res|
+              future_res.resubmit_query
+            end
+            initialize_results(future_result) unless future_result == future
           end
         end
       end
@@ -156,7 +160,7 @@ module ActiveRecord
         end
       end
 
-      def exec_cache(sql, name, binds)
+      def exec_cache(sql, name, binds, future_result: nil, pipeline_async: false)
         materialize_transactions
         mark_transaction_written_if_write(sql)
         update_typemap_for_default_timezone
@@ -166,15 +170,21 @@ module ActiveRecord
         log(sql, name, binds, type_casted_binds, stmt_key) do
           ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
             if is_pipeline_mode?
-              @connection.send_query_prepared(stmt_key, type_casted_binds)
-              @connection.pipeline_sync
-              future_result = FutureResult.new(self, sql, binds)
-              future_result.on_error do |exp|
-                handle_exec_cache(exp, sql, name, binds, future_result: future_result)
+              if pipeline_async
+                @connection.send_query_prepared(stmt_key, type_casted_binds)
+                @connection.send_flush_request
+                unless future_result
+                  future_result = FutureResult.new(self, sql, binds)
+                  future_result.on_error do |exp|
+                    handle_exec_cache(exp, sql, name, binds, future_result: future_result)
+                  end
+                end
+                @counter += 1
+                @piped_results << future_result
+                future_result
+              else
+                flush_pipeline_and_get_sync_result{  @connection.send_query_prepared(stmt_key, type_casted_binds) }
               end
-              @counter += 1
-              @piped_results << future_result
-              future_result
             else
               @connection.exec_prepared(stmt_key, type_casted_binds)
             end
@@ -200,7 +210,11 @@ module ActiveRecord
           if new_result.class == ActiveRecord::FutureResult && future_result
             future_result.assign(new_result.result)
           else
-            new_result
+            if future_result
+              future_result.assign(new_result)
+            else
+              new_result
+            end
           end
         end
       end
@@ -251,11 +265,8 @@ module ActiveRecord
               time_since_last_result = Time.now
               @current_future_result = @piped_results.shift
               @current_future_result.assign(result)
-              if required_future_result == @current_future_result && !@piped_results.empty?
-                flush_pipeline_sync
-                break
-              end
-            elsif pipeline_in_sync?(result) && @piped_results.empty?
+              break if required_future_result == @current_future_result
+            elsif @piped_results.empty?
               break
             elsif transaction_in_error?(@connection.transaction_status)
               @logger.error "Transaction status in error #{@connection.transaction_status}, expecting the status to cleaned up in next pipeline invocation"
@@ -272,26 +283,28 @@ module ActiveRecord
             end
           end
         rescue PG::Error => e
+          puts e
+          @connection.pipeline_sync
           @current_future_result = @piped_results.shift
           @logger.error "Raising error because future for query #{@current_future_result.sql} called at stack : #{@current_future_result.execution_stack} gave result #{result.try(:result_status)}"
           raise translate_exception_class(e, @current_future_result.sql, @current_future_result.binds)
         end
       end
 
-      def execute_and_clear(sql, name, binds, prepare: false, &block)
+      def execute_and_clear(sql, name, binds, prepare: false, future_result: nil, pipeline_async: false, &block)
         if preventing_writes? && write_query?(sql)
           raise ActiveRecord::ReadOnlyError, "Write query attempted while in readonly mode: #{sql}"
         end
 
         if !prepare || without_prepared_statement?(binds)
-          result = exec_no_cache(sql, name, binds)
+          result = exec_no_cache(sql, name, binds, future_result: future_result, pipeline_async: pipeline_async)
         else
-          result = exec_cache(sql, name, binds)
+          result = exec_cache(sql, name, binds, future_result: future_result, pipeline_async: pipeline_async)
         end
         # if @connection.pipeline_status == PG::PQ_PIPELINE_ON
         #   result
         # else
-        if is_pipeline_mode?
+        if is_pipeline_mode? && pipeline_async
           result.block = block
           return result
         else
@@ -305,14 +318,18 @@ module ActiveRecord
         ret
       end
 
-      def exec_query(sql, name = "SQL", binds = [], prepare: false)
-        execute_and_clear(sql, name, binds, prepare: prepare) do |result|
+      def exec_query(sql, name = "SQL", binds = [], prepare: false, pipeline_async: false, future_result: nil)
+        result = execute_and_clear(sql, name, binds, prepare: prepare, future_result: future_result, pipeline_async: pipeline_async) do |result|
           if !result.is_a?(FutureResult)
             build_ar_result(result)
           else
             result
           end
         end
+        if result.class == ActiveRecord::FutureResult
+          result.retry_block = Proc.new{ exec_query(sql, name, binds, prepare: prepare, future_result: result) }
+        end
+        result
       end
 
       def build_statement_pool

@@ -47,6 +47,26 @@ module ActiveRecord
             end
           end
         end
+        def select_all(arel, name = nil, binds = [], preparable: nil, pipeline_async: false)
+          arel = arel_from_relation(arel)
+          sql, binds, preparable = to_sql_and_binds(arel, binds, preparable)
+
+          if prepared_statements && preparable
+            select_prepared(sql, name, binds, pipeline_async: pipeline_async)
+          else
+            select(sql, name, binds, pipeline_async: pipeline_async)
+          end
+        rescue ::RangeError
+          ActiveRecord::Result.new([], [])
+        end
+
+        def select(sql, name = nil, binds = [], pipeline_async: false)
+          exec_query(sql, name, binds, prepare: false, pipeline_async: pipeline_async)
+        end
+
+        def select_prepared(sql, name = nil, binds = [], pipeline_async: false)
+          exec_query(sql, name, binds, prepare: true, pipeline_async: pipeline_async)
+        end
 
         def exec_delete(sql, name = nil, binds = [])
           execute_and_clear(sql, name, binds) do |result|

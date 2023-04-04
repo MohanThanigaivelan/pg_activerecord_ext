@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 module ActiveRecord
   class FutureResult # :nodoc:
-    attr_accessor :block, :sql, :binds, :execution_stack, :error, :exception_block
+    attr_accessor :block, :sql, :binds, :execution_stack, :error, :exception_block, :retry_block
 
     RESULT_TYPES = [ ActiveRecord::Result, Array , Integer].freeze
 
@@ -82,12 +82,17 @@ module ActiveRecord
       raise current_exp if current_exp
     end
 
+    def resubmit_query
+      retry_block.call
+      @pending = true
+    end
+
 
     def assign_error(error)
       @error = error
       @resolved_time = Time.now
       @pending = false
-      execute_on_error(error)
+      execute_on_error(error) unless @error.class == PriorQueryPipelineError
     end
 
     def ==(other)
